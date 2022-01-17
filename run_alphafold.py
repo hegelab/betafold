@@ -41,6 +41,8 @@ import numpy as np
 from alphafold.model import data
 # Internal import (7716).
 
+import configparser
+
 logging.set_verbosity(logging.INFO)
 
 flags.DEFINE_list(
@@ -116,7 +118,8 @@ flags.DEFINE_integer('random_seed', None, 'The random seed for the data '
 flags.DEFINE_boolean('use_precomputed_msas', False, 'Whether to read MSAs that '
                      'have been written to disk. WARNING: This will not check '
                      'if the sequence, database or configuration have changed.')
-
+flags.DEFINE_string("config_file", None, 'Configuration file with arguments '
+                    'and parameters.')
 FLAGS = flags.FLAGS
 
 MAX_TEMPLATE_HITS = 20
@@ -145,123 +148,169 @@ def predict_structure(
     amber_relaxer: relax.AmberRelaxation,
     benchmark: bool,
     random_seed: int,
+    hconfig: configparser.ConfigParser,
     is_prokaryote: Optional[bool] = None):
   """Predicts structure using AlphaFold for the given sequence."""
   logging.info('Predicting %s', fasta_name)
   timings = {}
-  output_dir = os.path.join(output_dir_base, fasta_name)
+  output_dir = hconfig.get("paths", "output_dir", fallback=os.path.join(output_dir_base, fasta_name))
   if not os.path.exists(output_dir):
     os.makedirs(output_dir)
   msa_output_dir = os.path.join(output_dir, 'msas')
   if not os.path.exists(msa_output_dir):
     os.makedirs(msa_output_dir)
 
-  # Get features.
-  t_0 = time.time()
-  if is_prokaryote is None:
-    feature_dict = data_pipeline.process(
-        input_fasta_path=fasta_path,
-        msa_output_dir=msa_output_dir)
-  else:
-    feature_dict = data_pipeline.process(
-        input_fasta_path=fasta_path,
-        msa_output_dir=msa_output_dir,
-        is_prokaryote=is_prokaryote)
-  timings['features'] = time.time() - t_0
+  running_get_features = hconfig.getboolean("steps", "get_features", fallback=True)
+  if running_get_features:
+    logging.info("*** hegelab: running get_features")
+    # Get features.
+    t_0 = time.time()
+    if is_prokaryote is None:
+      feature_dict = data_pipeline.process(
+          input_fasta_path=fasta_path,
+          msa_output_dir=msa_output_dir)
+    else:
+      feature_dict = data_pipeline.process(
+          input_fasta_path=fasta_path,
+          msa_output_dir=msa_output_dir,
+          is_prokaryote=is_prokaryote)
+    timings['features'] = time.time() - t_0
 
-  # Write out features as a pickled dictionary.
-  features_output_path = os.path.join(output_dir, 'features.pkl')
-  with open(features_output_path, 'wb') as f:
-    pickle.dump(feature_dict, f, protocol=4)
+    # Write out features as a pickled dictionary.
+    features_output_path = os.path.join(output_dir, 'features.pkl')
+    with open(features_output_path, 'wb') as f:
+      pickle.dump(feature_dict, f, protocol=4)
 
+  else:  # loading from previous one
+    logging.info("*** hegelab: skipping running get_features and loading from previous run")
+    features_output_path = os.path.join(output_dir, 'features.pkl')
+    feature_dict = pickle.load(open(features_output_path, 'rb'))
+
+
+  hmodel_names = ",".join(list(model_runners.keys()))
   unrelaxed_pdbs = {}
   relaxed_pdbs = {}
   ranking_confidences = {}
-
+  
   # Run the models.
-  num_models = len(model_runners)
-  for model_index, (model_name, model_runner) in enumerate(
-      model_runners.items()):
-    logging.info('Running model %s on %s', model_name, fasta_name)
-    t_0 = time.time()
-    model_random_seed = model_index + random_seed * num_models
-    processed_feature_dict = model_runner.process_features(
-        feature_dict, random_seed=model_random_seed)
-    timings[f'process_features_{model_name}'] = time.time() - t_0
-
-    t_0 = time.time()
-    prediction_result = model_runner.predict(processed_feature_dict,
-                                             random_seed=model_random_seed)
-    t_diff = time.time() - t_0
-    timings[f'predict_and_compile_{model_name}'] = t_diff
-    logging.info(
-        'Total JAX model %s on %s predict time (includes compilation time, see --benchmark): %.1fs',
-        model_name, fasta_name, t_diff)
-
-    if benchmark:
+  running_models = hconfig.getboolean("steps", "run_models", fallback=True)
+  if running_models:
+    logging.info("*** hegelab: running models")
+    num_models = len(model_runners)
+    for model_index, (model_name, model_runner) in enumerate(
+        model_runners.items()):
+      logging.info('Running model %s on %s', model_name, fasta_name)
       t_0 = time.time()
-      model_runner.predict(processed_feature_dict,
-                           random_seed=model_random_seed)
+      model_random_seed = model_index + random_seed * num_models
+      processed_feature_dict = model_runner.process_features(
+          feature_dict, random_seed=model_random_seed)
+      timings[f'process_features_{model_name}'] = time.time() - t_0
+
+      t_0 = time.time()
+      prediction_result = model_runner.predict(processed_feature_dict,
+                                               random_seed=model_random_seed)
       t_diff = time.time() - t_0
-      timings[f'predict_benchmark_{model_name}'] = t_diff
+      timings[f'predict_and_compile_{model_name}'] = t_diff
       logging.info(
-          'Total JAX model %s on %s predict time (excludes compilation time): %.1fs',
+          'Total JAX model %s on %s predict time (includes compilation time, see --benchmark): %.1fs',
           model_name, fasta_name, t_diff)
 
-    plddt = prediction_result['plddt']
-    ranking_confidences[model_name] = prediction_result['ranking_confidence']
+      if benchmark:
+        t_0 = time.time()
+        model_runner.predict(processed_feature_dict,
+                             random_seed=model_random_seed)
+        t_diff = time.time() - t_0
+        timings[f'predict_benchmark_{model_name}'] = t_diff
+        logging.info(
+            'Total JAX model %s on %s predict time (excludes compilation time): %.1fs',
+            model_name, fasta_name, t_diff)
 
-    # Save the model outputs.
-    result_output_path = os.path.join(output_dir, f'result_{model_name}.pkl')
-    with open(result_output_path, 'wb') as f:
-      pickle.dump(prediction_result, f, protocol=4)
+      plddt = prediction_result['plddt']
+      ranking_confidences[model_name] = prediction_result['ranking_confidence']
 
-    # Add the predicted LDDT in the b-factor column.
-    # Note that higher predicted LDDT value means higher model confidence.
-    plddt_b_factors = np.repeat(
-        plddt[:, None], residue_constants.atom_type_num, axis=-1)
-    unrelaxed_protein = protein.from_prediction(
-        features=processed_feature_dict,
-        result=prediction_result,
-        b_factors=plddt_b_factors,
-        remove_leading_feature_dimension=not model_runner.multimer_mode)
+      # Save the model outputs.
+      result_output_path = os.path.join(output_dir, f'result_{model_name}.pkl')
+      with open(result_output_path, 'wb') as f:
+        pickle.dump(prediction_result, f, protocol=4)
 
-    unrelaxed_pdbs[model_name] = protein.to_pdb(unrelaxed_protein)
-    unrelaxed_pdb_path = os.path.join(output_dir, f'unrelaxed_{model_name}.pdb')
-    with open(unrelaxed_pdb_path, 'w') as f:
-      f.write(unrelaxed_pdbs[model_name])
+      # Add the predicted LDDT in the b-factor column.
+      # Note that higher predicted LDDT value means higher model confidence.
+      plddt_b_factors = np.repeat(
+          plddt[:, None], residue_constants.atom_type_num, axis=-1)
+      unrelaxed_protein = protein.from_prediction(
+          features=processed_feature_dict,
+          result=prediction_result,
+          b_factors=plddt_b_factors,
+          remove_leading_feature_dimension=not model_runner.multimer_mode)
 
-    if amber_relaxer:
-      # Relax the prediction.
-      t_0 = time.time()
-      relaxed_pdb_str, _, _ = amber_relaxer.process(prot=unrelaxed_protein)
-      timings[f'relax_{model_name}'] = time.time() - t_0
-
-      relaxed_pdbs[model_name] = relaxed_pdb_str
-
-      # Save the relaxed PDB.
-      relaxed_output_path = os.path.join(
-          output_dir, f'relaxed_{model_name}.pdb')
-      with open(relaxed_output_path, 'w') as f:
-        f.write(relaxed_pdb_str)
-
-  # Rank by model confidence and write out relaxed PDBs in rank order.
-  ranked_order = []
-  for idx, (model_name, _) in enumerate(
-      sorted(ranking_confidences.items(), key=lambda x: x[1], reverse=True)):
-    ranked_order.append(model_name)
-    ranked_output_path = os.path.join(output_dir, f'ranked_{idx}.pdb')
-    with open(ranked_output_path, 'w') as f:
-      if amber_relaxer:
-        f.write(relaxed_pdbs[model_name])
-      else:
+      unrelaxed_pdbs[model_name] = protein.to_pdb(unrelaxed_protein)
+      unrelaxed_pdb_path = os.path.join(output_dir, f'unrelaxed_{model_name}.pdb')
+      with open(unrelaxed_pdb_path, 'w') as f:
         f.write(unrelaxed_pdbs[model_name])
 
-  ranking_output_path = os.path.join(output_dir, 'ranking_debug.json')
-  with open(ranking_output_path, 'w') as f:
-    label = 'iptm+ptm' if 'iptm' in prediction_result else 'plddts'
-    f.write(json.dumps(
-        {label: ranking_confidences, 'order': ranked_order}, indent=4))
+    ranking_output_path = os.path.join(output_dir, 'ranking_debug.json')
+    with open(ranking_output_path, 'w') as f:
+      label = 'iptm+ptm' if 'iptm' in prediction_result else 'plddts'
+      f.write(json.dumps({label: ranking_confidences}))
+
+  else:
+    logging.info("*** hegelab: skipping running models")
+
+  # RUNNING RELAX
+  running_relax = hconfig.getboolean("steps", "run_relax", fallback=True)
+  if running_relax:
+    logging.info("*** hegelab: running relax")
+
+    ranking_debug_fn = hconfig.get("relax", "ranking_debug", fallback="ranking_debug.json")
+    ranking_output_path = os.path.join(output_dir, ranking_debug_fn)
+    ranking_dict = json.load(open(ranking_output_path))
+    try:
+      ranking_confidences = ranking_dict["iptm+ptm"]
+    except KeyError:
+      ranking_confidences = ranking_dict["plddts"]
+      
+    # Rank by model confidence and write out relaxed PDBs in rank order.
+    ranked_order = []
+    for idx, (model_name, _) in enumerate(
+        sorted(ranking_confidences.items(), key=lambda x: x[1], reverse=True)):
+      ranked_order.append(model_name)
+
+    relax_models = hconfig.get("relax", "models", fallback=hmodel_names)
+    if relax_models == "top":
+      relax_models = ranked_order[0]
+
+    logging.info(f"??? relax_models: {relax_models}")
+    for model_name in relax_models.split(","):
+      unrelaxed_pdb_path = os.path.join(output_dir, f'unrelaxed_{model_name}.pdb')
+      unrelaxed_protein = protein.from_pdb_string(open(unrelaxed_pdb_path).read())
+
+      if amber_relaxer:
+        # Relax the prediction.
+        t_0 = time.time()
+        relaxed_pdb_str, _, _ = amber_relaxer.process(prot=unrelaxed_protein)
+        timings[f'relax_{model_name}'] = time.time() - t_0
+
+        relaxed_pdbs[model_name] = relaxed_pdb_str
+
+        # Save the relaxed PDB.
+        relaxed_output_path = os.path.join(
+            output_dir, f'relaxed_{model_name}.pdb')
+        with open(relaxed_output_path, 'w') as f:
+          f.write(relaxed_pdb_str)
+
+      idx = ranked_order.index(model_name)
+      ranked_output_path = os.path.join(output_dir, f'ranked_{idx}.pdb')
+      with open(ranked_output_path, 'w') as f:
+        if amber_relaxer:
+          f.write(relaxed_pdbs[model_name])
+        else:
+          f.write(unrelaxed_pdbs[model_name])
+
+    ranking_output_path = os.path.join(output_dir, 'ranking_debug.json')
+    with open(ranking_output_path, 'w') as f:
+      label = 'iptm+ptm' if 'iptm' in prediction_result else 'plddts'
+      f.write(json.dumps(
+          {label: ranking_confidences, 'order': ranked_order}, indent=4))
 
   logging.info('Final timings for %s: %s', fasta_name, timings)
 
@@ -301,6 +350,11 @@ def main(argv):
   else:
     num_ensemble = 1
 
+  # hegelab
+  hconfig = configparser.ConfigParser()
+  if FLAGS.config_file:
+    hconfig.read([fn for fn in FLAGS.config_file.split(",")])
+  
   # Check for duplicate FASTA file names.
   fasta_names = [pathlib.Path(p).stem for p in FLAGS.fasta_paths]
   if len(fasta_names) != len(set(fasta_names)):
@@ -322,6 +376,12 @@ def main(argv):
   else:  # Default is_prokaryote to False.
     is_prokaryote_list = [False] * len(fasta_names)
 
+
+  template_mmcif_dir = hconfig.get("paths", "template_mmcif_dir", fallback=FLAGS.template_mmcif_dir)
+  obsolete_pdbs_path = hconfig.get("paths", "obsolete_pdbs_path", fallback=FLAGS.obsolete_pdbs_path)
+  max_template_hits = hconfig.get("hhsearch_pdb70", "max_template_hits", fallback=MAX_TEMPLATE_HITS)
+  max_template_date = hconfig.get("hhsearch_pdb70", "max_template_date", fallback=FLAGS.max_template_date)
+    
   if run_multimer_system:
     template_searcher = hmmsearch.Hmmsearch(
         binary_path=FLAGS.hmmsearch_binary_path,
@@ -346,6 +406,13 @@ def main(argv):
         release_dates_path=None,
         obsolete_pdbs_path=FLAGS.obsolete_pdbs_path)
 
+  uniref90_database_path = hconfig.get("paths", "uniref90_database_path", fallback=FLAGS.uniref90_database_path)
+  mgnify_database_path = hconfig.get("paths", "mgnify_database_path", fallback=FLAGS.mgnify_database_path)
+  bfd_database_path = hconfig.get("paths", "bfd_database_path", fallback=FLAGS.bfd_database_path)
+  uniclust30_database_path = hconfig.get("paths", "uniclust30_database_path", fallback=FLAGS.uniclust30_database_path)
+  small_bfd_database_path = hconfig.get("paths", "small_bfd_database_path", fallback=FLAGS.small_bfd_database_path)
+  pdb70_database_path = hconfig.get("paths", "pdb70_database_path", fallback=FLAGS.pdb70_database_path)
+    
   monomer_data_pipeline = pipeline.DataPipeline(
       jackhmmer_binary_path=FLAGS.jackhmmer_binary_path,
       hhblits_binary_path=FLAGS.hhblits_binary_path,
@@ -409,6 +476,7 @@ def main(argv):
         amber_relaxer=amber_relaxer,
         benchmark=FLAGS.benchmark,
         random_seed=random_seed,
+        hconfig=hconfig,
         is_prokaryote=is_prokaryote)
 
 
